@@ -1,0 +1,579 @@
+package com.liupin.evaluation.core.process.swe;
+
+import cn.hutool.json.JSONUtil;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
+import com.liupin.evaluation.component.constant.EvaluationStrokeLocationProblemType;
+import com.liupin.evaluation.component.constant.EvaluationStrokeProblemType;
+import com.liupin.evaluation.component.constant.EvaluationStrokeWidthProblemType;
+import com.liupin.evaluation.core.WordCalculator;
+import com.liupin.evaluation.domain.ComponentConfigInfo;
+import com.liupin.evaluation.domain.EvaluationWord;
+import com.liupin.evaluation.domain.EvaluationWordResult;
+import com.liupin.evaluation.domain.params.WordQualitativeParams;
+import com.liupin.evaluation.domain.result.WordEvaluationResult;
+import com.liupin.tencent.services.CosFileService;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+import static com.liupin.common.constant.RedisKeyConstant.EVALUATION_COMPONENT_CONFIG_PREFIX;
+import static com.liupin.common.constant.RedisKeyConstant.getEvaluationStrokeKey;
+import static com.liupin.common.constant.RedisKeyConstant.getEvaluationStrokeStandardWordKey;
+import static com.liupin.common.constant.RedisKeyConstant.getEvaluationWordsKey;
+import static com.liupin.evaluation.component.constant.EvaluationStrokeLocationProblemType.LOCATION_NORMAL;
+import static com.liupin.evaluation.component.constant.EvaluationStrokeProblemType.WORD_LOCATION;
+import static com.liupin.evaluation.component.constant.EvaluationStrokeProblemType.WORD_WIDTH;
+import static com.liupin.evaluation.component.constant.EvaluationStrokeWidthProblemType.NORMAL;
+import static com.liupin.evaluation.component.constant.EvaluationWordResultCodeType.SINGLE_STROKE;
+import static com.liupin.evaluation.component.constant.EvaluationWordResultType.EVALUATION;
+import static com.liupin.tencent.utils.CosUtils.SCORECOPYBOOK_PREFIX;
+import static com.liupin.tencent.utils.CosUtils.buildFileKey;
+
+
+@Slf4j
+@Service
+public class StrokeCalculator implements WordCalculator<StrokeCalculator.StrokeResult> {
+
+    @Value("${python.stroke-stand-dir}")
+    private String strokeStandDir;
+
+
+    @Value("${python.stroke-stand-word-and-component}")
+    private String strokeStandWordAndComponent;
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @Autowired
+    private CosFileService cosFileService;
+
+    @Override
+    public EvaluationWordResult penEvaluate(String rule, WordQualitativeParams qualitativeParams, WordEvaluationResult wordEvaluationResult, List<EvaluationWordResult> wordResults) {
+        return null;
+    }
+
+
+    @Override
+    public EvaluationWordResult evaluate(String rule, WordQualitativeParams word, WordEvaluationResult wordEvaluationResult, List<EvaluationWordResult> wordResults) {
+        long s = System.currentTimeMillis();
+        Long photoId = wordEvaluationResult.getPhotoId();
+        Long wordId = wordEvaluationResult.getWordId();
+        WordEvaluationResult.CharacterOutline characterOutline = wordEvaluationResult.getCharacterOutline();
+        WordEvaluationResult.HighRadicalMatch highRadicalMatch = wordEvaluationResult.getHighRadicalMatch();
+        WordEvaluationResult.CharacterStroke characterStroke = wordEvaluationResult.getCharacterStroke();
+        if (highRadicalMatch == null || characterOutline == null || characterStroke == null) return null;
+
+        WordEvaluationResult.Outline boxHand = characterOutline.getBoxHand();
+        WordEvaluationResult.Outline boxStd = characterOutline.getBoxStd();
+        if (paramCheck(boxHand, boxStd)) return null;
+
+        StrokeCalculator.StrokeRuleInterval strokeRule = JSONObject.parseObject(rule, StrokeCalculator.StrokeRuleInterval.class);
+        List<WordEvaluationResult.BoxComponents> boxHandComponents = highRadicalMatch.getBoxHandComponents();
+        List<WordEvaluationResult.BoxComponents> boxStdComponents = highRadicalMatch.getBoxStdComponents();
+
+        log.info("笔画规则  算法推送结果 photoId :{}  wordId :{}    characterOutline：{}    highRadicalMatch：{}   characterStroke：{}", photoId, wordId, JSON.toJSONString(characterOutline), JSON.toJSONString(highRadicalMatch), JSON.toJSONString(characterStroke));
+
+        //整字宽度判断
+        Double wholeWordRateValue = getWidthRate(boxHand.getWidth(), boxHand.getHeight(), boxStd.getWidth(), boxStd.getHeight());
+        WidthRateRule wholeWordWidthRateResult = getWidthRateResult(wholeWordRateValue, strokeRule.getWholeWordRateIntervals());
+        Integer result = wholeWordWidthRateResult.getResult();
+        log.info("笔画规则  photoId :{}  wordId :{}  整字宽度计算结果 ：{} {}", photoId, wordId, result, EvaluationStrokeWidthProblemType.getValue(result));
+
+        StrokeEvaluateResult strokeEvaluateResult = new StrokeEvaluateResult();
+        strokeEvaluateResult.setPhotoId(photoId);
+        strokeEvaluateResult.setWordId(wordId);
+        strokeEvaluateResult.setWordCode(getWordCode(photoId, wordId));
+
+        if (CollectionUtils.isEmpty(boxHandComponents) || CollectionUtils.isEmpty(boxStdComponents)) {
+            return EvaluationWordResult.builder().type(EVALUATION.type).code(SINGLE_STROKE.code).createDate(new Date()).result(JSONUtil.toJsonStr(strokeEvaluateResult)).build();
+        }
+
+        //评测宽度
+        wordEvaluateWidth(photoId, wordId, characterOutline, result, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+
+        //评测位置
+        if (!strokeEvaluateResult.getProblemResult()) {
+            List<LocationRule> wholeWordLocationIntervals = strokeRule.getWholeWordLocationIntervals();
+            LocationRule wordLocationOutlineRateResult = getLocationOutlineRateResult(photoId, wordId, wholeWordLocationIntervals, boxHand, boxStd);
+            Integer locationResult = wordLocationOutlineRateResult.getResult();
+            log.info("笔画规则  photoId :{}  wordId :{}  整字位置计算结果 ：{} {}", photoId, wordId, locationResult, EvaluationStrokeLocationProblemType.getValue(locationResult));
+            wordEvaluateLocation(photoId, wordId, characterOutline, locationResult, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+        }
+
+        //评测组件
+        componentEvaluateWidthFirst(true, photoId, wordId, result, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+        componentEvaluateLocationFirst(true, photoId, wordId, true, result, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+
+        log.info("耗时统计单字笔画维度评测耗时 photoId :{} wordId ：{}  中台定性结果：{}  耗时 ：{} ", photoId, wordId, JSON.toJSONString(strokeEvaluateResult), System.currentTimeMillis() - s);
+        return EvaluationWordResult.builder().type(EVALUATION.type).code(SINGLE_STROKE.code).createDate(new Date()).result(JSONUtil.toJsonStr(strokeEvaluateResult)).build();
+    }
+
+    private void wordEvaluateLocation(Long photoId, Long wordId, WordEvaluationResult.CharacterOutline characterOutline, Integer locationResult, StrokeRuleInterval strokeRule, StrokeEvaluateResult strokeEvaluateResult, List<WordEvaluationResult.BoxComponents> boxHandComponents, List<WordEvaluationResult.BoxComponents> boxStdComponents, WordEvaluationResult.CharacterStroke characterStroke) {
+        if (Objects.nonNull(locationResult) && !LOCATION_NORMAL.getCode().equals(locationResult)) {
+            setWordEvaluateResult(strokeEvaluateResult, WORD_LOCATION.getCode(), locationResult, EvaluationStrokeLocationProblemType.getValue(locationResult), characterOutline);
+
+            componentEvaluateLocationFirst(false, photoId, wordId, true, locationResult, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+            componentEvaluateWidthFirst(false, photoId, wordId, locationResult, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+        }
+    }
+
+    private void wordEvaluateWidth(Long photoId, Long wordId, WordEvaluationResult.CharacterOutline characterOutline, Integer result, StrokeRuleInterval strokeRule, StrokeEvaluateResult strokeEvaluateResult, List<WordEvaluationResult.BoxComponents> boxHandComponents, List<WordEvaluationResult.BoxComponents> boxStdComponents, WordEvaluationResult.CharacterStroke characterStroke) {
+        if (Objects.nonNull(result) && !NORMAL.getCode().equals(result)) {
+            setWordEvaluateResult(strokeEvaluateResult, WORD_WIDTH.getCode(), result, EvaluationStrokeWidthProblemType.getValue(result), characterOutline);
+
+            componentEvaluateWidthFirst(false, photoId, wordId, result, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+            componentEvaluateLocationFirst(false, photoId, wordId, false, result, strokeRule, strokeEvaluateResult, boxHandComponents, boxStdComponents, characterStroke);
+        }
+    }
+
+    /**
+     * 组件评测位置
+     *
+     * @param isFinally            是否是最后一步组件评测
+     * @param locationFirst        位置是否为主问题 ， true - 位置问题   false-宽度问题，再找位置问题 需调用 checkLocationResult进行问题转化
+     * @param result
+     * @param strokeRule
+     * @param strokeEvaluateResult
+     * @param boxHandComponents
+     * @param boxStdComponents
+     * @param characterStroke
+     */
+    private void componentEvaluateLocationFirst(Boolean isFinally, Long photoId, Long wordId, Boolean locationFirst, Integer result, StrokeRuleInterval strokeRule, StrokeEvaluateResult strokeEvaluateResult, List<WordEvaluationResult.BoxComponents> boxHandComponents, List<WordEvaluationResult.BoxComponents> boxStdComponents, WordEvaluationResult.CharacterStroke characterStroke) {
+        if (!strokeEvaluateResult.getProblemResult()) {
+            List<LocationRule> componentLocationIntervals = strokeRule.getComponentLocationIntervals();
+            for (int i = 0; i < boxHandComponents.size(); i++) {
+                LocationRule locationStrokeOutlineRateResult = getLocationOutlineRateResult(photoId, wordId, componentLocationIntervals, boxHandComponents.get(i).getOutline(), boxStdComponents.get(i).getOutline());
+                Integer componentLocationResult = locationStrokeOutlineRateResult.getResult();
+                Integer componentResult = locationFirst ? componentLocationResult : EvaluationStrokeWidthProblemType.checkLocationResult(componentLocationResult);
+
+                List<WordEvaluationResult.Stroke> handStroke = characterStroke.getHandStroke();
+                List<WordEvaluationResult.Stroke> stdStroke = characterStroke.getStdStroke();
+
+                log.info("笔画规则 isFinally：{}  photoId :{}  wordId :{}  第  {}  个组件位置 计算结果 ：{} {}", isFinally, photoId, wordId, boxHandComponents.get(i).getType(), componentResult, EvaluationStrokeLocationProblemType.getValue(componentResult));
+                if (isFinally && !LOCATION_NORMAL.getCode().equals(componentResult)) {
+                    setComponentEvaluateResult(strokeEvaluateResult, WORD_LOCATION.getCode(), componentResult, EvaluationStrokeLocationProblemType.getValue(componentResult), boxHandComponents.get(i), boxStdComponents.get(i));
+                    strokeEvaluateLocationFirst(boxHandComponents.get(i).getType(), photoId, wordId, strokeEvaluateResult, strokeRule, componentResult, handStroke, stdStroke);
+                    break;
+                }
+
+                if (!isFinally && componentResult.equals(result)) {
+                    setComponentEvaluateResult(strokeEvaluateResult, WORD_LOCATION.getCode(), componentResult, EvaluationStrokeLocationProblemType.getValue(componentResult), boxHandComponents.get(i), boxStdComponents.get(i));
+                    strokeEvaluateLocationFirst(boxHandComponents.get(i).getType(), photoId, wordId, strokeEvaluateResult, strokeRule, componentResult, handStroke, stdStroke);
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * 组件点评测宽度
+     *
+     * @param isFinally            是否是最后一步组件评测
+     * @param photoId
+     * @param wordId
+     * @param result
+     * @param strokeRule
+     * @param strokeEvaluateResult
+     * @param boxHandComponents
+     * @param boxStdComponents
+     * @param characterStroke
+     */
+    private void componentEvaluateWidthFirst(Boolean isFinally, Long photoId, Long wordId, Integer result, StrokeRuleInterval strokeRule, StrokeEvaluateResult strokeEvaluateResult, List<WordEvaluationResult.BoxComponents> boxHandComponents, List<WordEvaluationResult.BoxComponents> boxStdComponents, WordEvaluationResult.CharacterStroke characterStroke) {
+        if (!strokeEvaluateResult.getProblemResult()) {
+            List<WidthRateRule> componentRateIntervals = strokeRule.getComponentRateIntervals();
+            for (int i = 0; i < boxHandComponents.size(); i++) {
+                WidthRateRule componentRateResult = getWidthOutlineRateResult(componentRateIntervals, boxHandComponents.get(i).getOutline(), boxStdComponents.get(i).getOutline());
+                Integer componentResult = componentRateResult.getResult();
+                log.info("笔画规则  photoId :{}  wordId :{}  第  {}  个组件宽度 计算结果 ：{} {}", photoId, wordId, boxHandComponents.get(i).getType(), componentResult, EvaluationStrokeWidthProblemType.getValue(componentResult));
+
+                List<WordEvaluationResult.Stroke> handStroke = characterStroke.getHandStroke();
+                List<WordEvaluationResult.Stroke> stdStroke = characterStroke.getStdStroke();
+
+                if (isFinally && !NORMAL.getCode().equals(componentResult)) {
+                    setComponentEvaluateResult(strokeEvaluateResult, WORD_WIDTH.getCode(), componentResult, EvaluationStrokeWidthProblemType.getValue(componentResult), boxHandComponents.get(i), boxStdComponents.get(i));
+                    strokeEvaluateWidthFirst(boxHandComponents.get(i).getType(), photoId, wordId, strokeEvaluateResult, strokeRule, componentResult, handStroke, stdStroke);
+
+                    break;
+                }
+
+                if (!isFinally && componentResult.equals(result)) {
+                    setComponentEvaluateResult(strokeEvaluateResult, WORD_WIDTH.getCode(), componentResult, EvaluationStrokeWidthProblemType.getValue(componentResult), boxHandComponents.get(i), boxStdComponents.get(i));
+                    strokeEvaluateWidthFirst(boxHandComponents.get(i).getType(), photoId, wordId, strokeEvaluateResult, strokeRule, componentResult, handStroke, stdStroke);
+
+                    break;
+                }
+            }
+        }
+    }
+
+    private StrokeEvaluateResult strokeEvaluateWidthFirst(Integer componentNum, Long photoId, Long wordId, StrokeEvaluateResult strokeEvaluateResult, StrokeRuleInterval strokeRule, Integer result, List<WordEvaluationResult.Stroke> handStroke, List<WordEvaluationResult.Stroke> stdStroke) {
+        strokeEvaluateWidth(componentNum, photoId, wordId, strokeEvaluateResult, strokeRule, result, handStroke, stdStroke);
+        strokeEvaluateLocation(componentNum, photoId, wordId, false, strokeEvaluateResult, strokeRule, result, handStroke, stdStroke);
+        return strokeEvaluateResult;
+    }
+
+    private StrokeEvaluateResult strokeEvaluateLocationFirst(Integer componentNum, Long photoId, Long wordId, StrokeEvaluateResult strokeEvaluateResult, StrokeRuleInterval strokeRule, Integer result, List<WordEvaluationResult.Stroke> handStroke, List<WordEvaluationResult.Stroke> stdStroke) {
+        strokeEvaluateLocation(componentNum, photoId, wordId, true, strokeEvaluateResult, strokeRule, result, handStroke, stdStroke);
+        strokeEvaluateWidth(componentNum, photoId, wordId, strokeEvaluateResult, strokeRule, result, handStroke, stdStroke);
+
+        return strokeEvaluateResult;
+    }
+
+    /**
+     * @param locationFirst        位置是否为主问题 ， true - 位置问题   false-宽度问题，再找位置问题 需调用 checkLocationResult进行问题转化
+     * @param strokeEvaluateResult
+     * @param strokeRule
+     * @param result
+     * @param handStroke
+     * @param stdStroke
+     */
+    private void strokeEvaluateLocation(Integer componentNum, Long photoId, Long wordId, Boolean locationFirst, StrokeEvaluateResult strokeEvaluateResult, StrokeRuleInterval strokeRule, Integer result, List<WordEvaluationResult.Stroke> handStroke, List<WordEvaluationResult.Stroke> stdStroke) {
+        if (!strokeEvaluateResult.getProblemResult()) {
+            List<LocationRule> strokeLocationIntervals = strokeRule.getStrokeLocationIntervals();
+            Integer wordCode = getWordCode(photoId, wordId);
+            ComponentConfigInfo.ComponentDetail componentDetail = getComponentDetailByCurrentComponentNum(photoId, wordId, wordCode, componentNum);
+            if (Objects.nonNull(componentDetail) && componentDetail.getStart() > 0) {
+                for (int i = 0; i < handStroke.size(); i++) {
+                    if (handStroke.get(i).getType() >= componentDetail.getStart() && handStroke.get(i).getType() <= componentDetail.getEnd()) {
+                        log.info("笔画位置====================== photoId :{}  wordId :{}  组件起始笔画序号 ：{}  组件结束笔画序号 ：{}   当前笔画序号 : {}", photoId, wordId, componentDetail.getStart(), componentDetail.getEnd(), handStroke.get(i).getType());
+                        LocationRule locationStrokeOutlineRateResult = getLocationOutlineRateResult(photoId, wordId, strokeLocationIntervals, handStroke.get(i).getOutline(), stdStroke.get(i).getOutline());
+                        Integer strokeLocationResult = locationStrokeOutlineRateResult.getResult();
+                        Integer strokeResult = locationFirst ? strokeLocationResult : EvaluationStrokeWidthProblemType.checkLocationResult(strokeLocationResult);
+
+                        log.info("笔画规则  photoId :{}  wordId :{}  第  {}  个笔画位置 计算结果 ：{} {}", photoId, wordId, handStroke.get(i).getType(), strokeResult, EvaluationStrokeLocationProblemType.getValue(strokeResult));
+                        if (result.equals(strokeResult)) {
+                            setStrokeEvaluateResult(strokeEvaluateResult, wordCode, WORD_LOCATION.getCode(), strokeLocationResult, EvaluationStrokeLocationProblemType.getValue(strokeLocationResult), handStroke.get(i), stdStroke.get(i));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void strokeEvaluateWidth(Integer componentNum, Long photoId, Long wordId, StrokeEvaluateResult strokeEvaluateResult, StrokeRuleInterval strokeRule, Integer result, List<WordEvaluationResult.Stroke> handStroke, List<WordEvaluationResult.Stroke> stdStroke) {
+        if (!strokeEvaluateResult.getProblemResult()) {
+            List<WidthRateRule> strokeRateIntervals = strokeRule.getStrokeRateIntervals();
+            Integer wordCode = getWordCode(photoId, wordId);
+            ComponentConfigInfo.ComponentDetail componentDetail = getComponentDetailByCurrentComponentNum(photoId, wordId, wordCode, componentNum);
+
+            if (Objects.nonNull(componentDetail) && componentDetail.getStart() > 0) {
+                for (int i = 0; i < handStroke.size(); i++) {
+                    if (handStroke.get(i).getType() >= componentDetail.getStart() && handStroke.get(i).getType() <= componentDetail.getEnd()) {
+                        log.info("笔画宽度====================== photoId :{}  wordId :{}  组件起始笔画序号 ：{}  组件结束笔画序号 ：{}   当前笔画序号 : {}", photoId, wordId, componentDetail.getStart(), componentDetail.getEnd(), handStroke.get(i).getType());
+                        WidthRateRule strokeRateResult = getWidthOutlineRateResult(strokeRateIntervals, handStroke.get(i).getOutline(), stdStroke.get(i).getOutline());
+                        Integer strokeWidthResult = strokeRateResult.getResult();
+                        log.info("笔画规则  photoId :{}  wordId :{}  第  {}  个笔画宽度 计算结果 ：{} {}", photoId, wordId, handStroke.get(i).getType(), strokeWidthResult, EvaluationStrokeWidthProblemType.getValue(strokeWidthResult));
+                        if (result.equals(strokeWidthResult)) {
+                            setStrokeEvaluateResult(strokeEvaluateResult, wordCode, WORD_WIDTH.getCode(), strokeWidthResult, EvaluationStrokeWidthProblemType.getValue(strokeWidthResult), handStroke.get(i), stdStroke.get(i));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 获取当前组件的配置详情
+    private ComponentConfigInfo.ComponentDetail getComponentDetailByCurrentComponentNum(Long photoId, Long wordId, Integer wordCode, Integer componentNum) {
+        ComponentConfigInfo.ComponentDetail currentComponentDetail = Optional.ofNullable(wordCode).map(code -> Optional.ofNullable(redisTemplate.opsForValue().get(EVALUATION_COMPONENT_CONFIG_PREFIX + wordCode)).map(str -> JSONObject.parseObject(str.toString(), ComponentConfigInfo.class)).map(componentConfigInfo -> {
+                    List<ComponentConfigInfo.ComponentDetail> componentDetails = componentConfigInfo.getComponentDetails();
+                    Optional<ComponentConfigInfo.ComponentDetail> componentDetailOptional = componentDetails.stream().filter(componentDetail -> componentDetail.getComponentNum().equals(componentNum)).findFirst();
+
+                    if (componentDetailOptional.isPresent()) {
+                        return componentDetailOptional.get();
+                    }
+                    return null;
+                }).orElseGet(() -> {
+                    log.error("笔画规则 photoId :{}  wordId :{} 未查询到第 ：{} 个组件字库配置", photoId, wordId, componentNum);
+                    return null;
+                })
+
+        ).orElseGet(() -> {
+            log.error("笔画规则 photoId :{}  wordId :{} 未获取到当前字第 ：{} 组件的笔画起始编号", photoId, wordId, componentNum);
+            return null;
+        });
+        log.info("笔画规则 photoId :{}  wordId :{} 当前字第 ：{} 组件的笔画起始编号是 ：{} 结束编号是 ：{}", photoId, wordId, componentNum, currentComponentDetail.getStart(), currentComponentDetail.getEnd());
+        return currentComponentDetail;
+    }
+
+    private Integer getWordCode(Long photoId, Long wordId) {
+        String evaluationWordsKey = getEvaluationWordsKey(photoId);
+        Object wordCacheObj = redisTemplate.opsForHash().get(evaluationWordsKey, String.valueOf(wordId));
+        return Optional.ofNullable(wordCacheObj).map(wordCache -> JSON.parseObject(wordCache.toString(), EvaluationWord.class)).map(evaluationWord -> evaluationWord.getWordCode()).map(wordCodeCache -> Integer.parseInt(wordCodeCache)).orElseGet(() -> {
+            log.warn("笔画规则 当前作品 photoId ：{} wordId ：{} 未获取到wordCode", photoId, wordId);
+            return null;
+        });
+    }
+
+    private void setWordEvaluateResult(StrokeEvaluateResult strokeEvaluateResult, Integer code, Integer result, String resultValue, WordEvaluationResult.CharacterOutline characterOutline) {
+        strokeEvaluateResult.setWordProblemType(code);
+        strokeEvaluateResult.setWordProblemTypeValue(EvaluationStrokeProblemType.getValue(code));
+        strokeEvaluateResult.setWordProblemDetailType(result);
+        strokeEvaluateResult.setWordProblemDetailTypeValue(resultValue);
+        strokeEvaluateResult.setWordCharacterOutline(characterOutline);
+    }
+
+    private void setComponentEvaluateResult(StrokeEvaluateResult strokeEvaluateResult, Integer code, Integer componentResult, String componentResultValue, WordEvaluationResult.BoxComponents handComponents, WordEvaluationResult.BoxComponents stdComponents) {
+        strokeEvaluateResult.setComponentProblemType(code);
+        strokeEvaluateResult.setComponentProblemTypeValue(EvaluationStrokeProblemType.getValue(code));
+        strokeEvaluateResult.setComponentProblemDetailType(componentResult);
+        strokeEvaluateResult.setComponentProblemDetailTypeValue(componentResultValue);
+        strokeEvaluateResult.setComponentHand(handComponents);
+        strokeEvaluateResult.setComponentStd(stdComponents);
+    }
+
+    private void setStrokeEvaluateResult(StrokeEvaluateResult strokeEvaluateResult, Integer wordCode, Integer code, Integer strokeLocationResult, String strokeLocationResultValue, WordEvaluationResult.Stroke handStroke, WordEvaluationResult.Stroke stStroke) {
+        strokeEvaluateResult.setProblemResult(true);
+        strokeEvaluateResult.setStrokeProblemType(code);
+        strokeEvaluateResult.setStrokeProblemTypeValue(EvaluationStrokeProblemType.getValue(code));
+        strokeEvaluateResult.setStrokeProblemDetailType(strokeLocationResult);
+        strokeEvaluateResult.setStrokeProblemDetailTypeValue(strokeLocationResultValue);
+        strokeEvaluateResult.setStrokeHand(handStroke);
+        strokeEvaluateResult.setStrokeStd(stStroke);
+
+        Integer type = handStroke.getType();
+        Map<String, String> map = getStrokeStandardTypeValues(type, wordCode);
+
+        strokeEvaluateResult.setStrokeStandardTypeValue(map.get("strokeStandardTypeValue"));
+        strokeEvaluateResult.setStrokeStandardWordPic(map.get("strokeStandardWordPic"));
+    }
+
+    private Map<String, String> getStrokeStandardTypeValues(Integer type, Integer wordCode) {
+        Map resultMap = new HashMap<String, String>(2);
+        String strokePath = strokeStandDir + wordCode + "/" + type + ".png";
+        String standardWord = strokeStandWordAndComponent + wordCode + ".png";
+
+        String strokePathKey = getEvaluationStrokeKey(strokePath);
+        String standardWordPathKey = getEvaluationStrokeStandardWordKey(standardWord);
+
+        String strokeStandardTypeValue = getMapValue(strokePathKey, strokePath);
+        String strokeStandardWordPic = getMapValue(standardWordPathKey, standardWord);
+        resultMap.put("strokeStandardTypeValue", strokeStandardTypeValue);
+        resultMap.put("strokeStandardWordPic", strokeStandardWordPic);
+
+        return resultMap;
+    }
+
+    private String getMapValue(String strokePathKey, String path) {
+        Object strokePathObj = redisTemplate.opsForValue().get(strokePathKey);
+        Optional<String> optional = Optional.ofNullable(strokePathObj).map(pathObj -> (String) pathObj);
+        if (optional.isPresent()) {
+            return optional.get();
+        } else {
+            File file = new File(path);
+            if (!file.exists()) {
+                log.warn("笔画规则 本地图片不存在 path :{} redisKey :{} ", path, strokePathKey);
+                return null;
+            }
+            String cosUrl = cosFileService.xsjyUpload(path, buildFileKey(SCORECOPYBOOK_PREFIX));
+            if (StringUtils.isNotBlank(cosUrl)) {
+                redisTemplate.opsForValue().set(strokePathKey, cosUrl, 3L, TimeUnit.DAYS);
+            }
+            return cosUrl;
+        }
+    }
+
+    private Double getWidthRate(Integer handWidth, Integer handHeight, Integer stdWidth, Integer stdHeight) {
+        Double value = new BigDecimal(handWidth).multiply(new BigDecimal(stdHeight)).divide(new BigDecimal(handHeight).multiply(new BigDecimal(stdWidth)), BigDecimal.ROUND_HALF_UP, 2).doubleValue();
+        log.info("【计算相关】笔画评测维度未计算宽窄比例 handWidth ：{}  handHeight：{} stdWidt：{} stdHeight：{}  结果：{} ", handWidth, handHeight, stdWidth, stdHeight, value);
+        return value;
+    }
+
+    private WidthRateRule getWidthRateResult(Double rate, List<WidthRateRule> widthRateResultList) {
+        return widthRateResultList.stream().filter(interval -> widthCompare(rate, interval.getLeft(), interval.getRight())).findFirst().orElseGet(() -> {
+            WidthRateRule widthRateResult = new WidthRateRule();
+            log.warn("笔画评测维度未找到宽度相关区间值 宽高比 :{}   规则区间 ：{} ", rate, JSON.toJSONString(widthRateResultList));
+            return widthRateResult;
+        });
+    }
+
+    private LocationRule getLocationResult(Integer axisType, Integer axisDifference, List<LocationRule> locationRuleList) {
+        return locationRuleList.stream().filter(interval -> interval.getAxisType().equals(axisType) && locationCompare(axisDifference, interval.getLeft(), interval.getRight())).findFirst().orElseGet(() -> {
+            LocationRule locationRule = new LocationRule();
+            log.warn("笔画评测维度未找到位置相关区间值 类型 ：{} 位置坐标轴差值：{} 规则区间 ：{} ", axisType, axisDifference, JSON.toJSONString(locationRuleList));
+            return locationRule;
+        });
+    }
+
+
+    //宽度区间结果
+    private WidthRateRule getWidthOutlineRateResult(List<WidthRateRule> widthRateRuleIntervals, WordEvaluationResult.Outline handOutline, WordEvaluationResult.Outline stdOutline) {
+        Double widthRate = getWidthRate(handOutline.getWidth(), handOutline.getHeight(), stdOutline.getWidth(), stdOutline.getHeight());
+        WidthRateRule componentRateResult = getWidthRateResult(widthRate, widthRateRuleIntervals);
+        return componentRateResult;
+    }
+
+    //位置 区间结果
+    private LocationRule getLocationOutlineRateResult(Long photoId, Long wordId, List<LocationRule> locationRateIntervals, WordEvaluationResult.Outline handOutline, WordEvaluationResult.Outline stdOutline) {
+        Integer handCenterX = handOutline.getCenterX();
+        Integer stdCenterX = stdOutline.getCenterX();
+        Integer XDifference = handCenterX - stdCenterX;
+
+        Integer handCenterY = handOutline.getCenterY();
+        Integer stdCenterY = stdOutline.getCenterY();
+        Integer YDifference = handCenterY - stdCenterY;
+
+        Boolean abs = Math.abs(XDifference) >= Math.abs(YDifference);
+        Integer maxDifference = abs ? XDifference : YDifference;
+        Integer axisType = abs ? 1 : 2;
+
+        LocationRule locationRuleResult = getLocationResult(axisType, maxDifference, locationRateIntervals);
+        log.info("【计算相关】笔画评测维度未计算位置 photoId:{} wordId :{} axisType:{}   XDifference:{}   YDifference:{}  maxDifference:{}   locationRateIntervals :{} 结果result：{}  结果result value:{}", photoId, wordId, axisType, XDifference, YDifference, maxDifference, JSON.toJSONString(locationRateIntervals), locationRuleResult.getResult(), EvaluationStrokeLocationProblemType.getValue(locationRuleResult.getResult()));
+        return locationRuleResult;
+    }
+
+    private boolean paramCheck(WordEvaluationResult.Outline boxHand, WordEvaluationResult.Outline boxStd) {
+        //校验必要参数
+        Boolean handParamCheck = Optional.ofNullable(boxHand).map(box -> Objects.nonNull(box.getHeight()) && Objects.nonNull(box.getWidth()) && box.getHeight() > 0 && box.getWidth() > 0).orElse(false);
+        Boolean stdParamCheck = Optional.ofNullable(boxStd).map(box -> Objects.nonNull(box.getHeight()) && Objects.nonNull(box.getWidth()) && box.getHeight() > 0 && box.getWidth() > 0).orElse(false);
+        return !(handParamCheck && stdParamCheck);
+    }
+
+    //宽度规则校验
+    private Boolean widthCompare(Double value, Double left, Double right) {
+        Boolean result = left <= value && value < right;
+        return result;
+    }
+
+    //位置规则校验
+    private Boolean locationCompare(Integer value, Integer left, Integer right) {
+        Integer leftValue = Objects.isNull(left) ? Integer.MIN_VALUE : left;
+        Integer rightValue = Objects.isNull(right) ? Integer.MAX_VALUE : right;
+
+        Boolean result = leftValue <= value && value < rightValue;
+        return result;
+    }
+
+    @Override
+    public StrokeResult getResult(EvaluationWordResult wordResult) {
+        return null;
+    }
+
+    @Override
+    public StrokeResult getResult(Long wordId) {
+        return null;
+    }
+
+    @Data
+    public static class StrokeResult {
+
+        private String result;
+
+        private Integer score;
+
+        private Integer starNumber;
+    }
+
+
+    @Data
+    private static class StrokeRuleInterval {
+
+        private List<WidthRateRule> wholeWordRateIntervals;
+        private List<WidthRateRule> componentRateIntervals;
+        private List<WidthRateRule> strokeRateIntervals;
+
+        private List<LocationRule> wholeWordLocationIntervals;
+
+        private List<LocationRule> componentLocationIntervals;
+        private List<LocationRule> strokeLocationIntervals;
+
+    }
+
+
+    @Data
+    private static class WidthRateRule {
+
+        private Double left;
+
+        private Double right;
+
+        private Integer result;
+    }
+
+
+    @Data
+    private static class LocationRule {
+
+        //坐标轴类型   1-x轴规则   2-y轴规则
+        private Integer axisType;
+
+        private Integer left;
+
+        private Integer right;
+
+        private Integer result;
+    }
+
+
+    @Data
+    private static class StrokeEvaluateResult {
+
+        private Long photoId;
+
+        private Long wordId;
+
+        private Integer wordCode;
+
+        private Boolean problemResult = false;
+
+        //整字问题
+        private Integer wordProblemType;
+
+        private String wordProblemTypeValue;
+
+        private Integer wordProblemDetailType;
+
+        private String wordProblemDetailTypeValue;
+
+        private WordEvaluationResult.CharacterOutline wordCharacterOutline;
+
+
+        //组件问题
+        private Integer componentProblemType;
+
+        private String componentProblemTypeValue;
+
+        private Integer componentProblemDetailType;
+
+        private String componentProblemDetailTypeValue;
+
+        private WordEvaluationResult.BoxComponents componentHand;
+
+        private WordEvaluationResult.BoxComponents componentStd;
+
+
+        //笔画问题
+        private Integer strokeProblemType;
+
+        private String strokeProblemTypeValue;
+
+        private Integer strokeProblemDetailType;
+
+        private String strokeProblemDetailTypeValue;
+
+        private String strokeStandardTypeValue;
+
+        private String strokeStandardWordPic;
+
+        private WordEvaluationResult.Stroke strokeHand;
+
+        private WordEvaluationResult.Stroke strokeStd;
+    }
+}
